@@ -1,69 +1,124 @@
-# A股智能量化监控系统
+# A股量化交易系统
 
-基于本地大模型的A股+基金智能监控系统，融合技术分析、新闻舆情、政策解读，
-实时生成买卖信号、建仓/清仓建议、止盈止损点位。
+多策略融合的A股量化交易系统，支持回测、实盘扫描、参数优化、Web监控。
+
+## 架构
+
+```
+数据层 (data) → 策略层 (strategy) → 风控层 (risk) → 执行层 (execution)
+                              ↕
+                         信号总线 (signal_bus)
+                              ↕
+                        通知推送 (notifier)
+```
 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
-cd /Users/tianye/Downloads/a_stock_monitor
-uv pip install --python .venv/bin/python akshare pandas pandas-ta plotly mplfinance openai rich pyyaml streamlit
+# 扫描全部自选股
+./deploy.sh once
 
-# 2. 编辑配置 (添加自选股)
-vim config/settings.yaml
+# 持续监控(每5分钟)
+./deploy.sh            # 前台
+./deploy.sh bg         # 后台(screen)
 
-# 3. 运行模式选择
+# 回测
+python main.py --mode backtest
 
-# 单次扫描
-python start.py --mode once
-
-# 持续监控 (每5分钟扫描)
-python start.py --mode loop --interval 5
+# 参数优化
+python main.py --mode optimize
 
 # Web面板
-python start.py --mode web
+./deploy.sh web
 ```
 
-## 功能特性
+## 策略体系 (6策略融合)
 
-- 📊 实时行情监控 (A股+ETF基金)
-- 📈 技术指标分析 (MA/MACD/RSI/KDJ/布林带/ATR)
-- 🕯️ K线形态识别 (锤子线/吞没/十字星)
-- 💰 资金流向分析 (主力/大单/北向)
-- 📰 新闻舆情分析 (本地大模型驱动)
-- 🎯 多因子信号融合 (技术40%+资金20%+消息25%+基本面15%)
-- ⚠️ 风险管理 (ATR止损/分批止盈/仓位控制)
-- 📱 多渠道通知 (企业微信/钉钉/Server酱/Bark)
-- 🖥️ Web监控面板 (交互式K线+信号流)
+| 策略 | 权重 | 说明 |
+|------|------|------|
+| 技术分析 | 0.30 | MA排列/MACD/RSI/KDJ/量能/市场状态 |
+| 资金流向 | 0.15 | 主力净流入(3源回退) |
+| 多时间框架 | 0.15 | 日线/60分/15分趋势一致性 |
+| 成交量形态 | 0.15 | 缩量见底/量价背离/底部放量 |
+| 趋势强度 | 0.10 | ADX/DMI/布林带位置 |
+| 新闻情绪 | 0.15 | LLM分析(需配置) |
 
-## 配置说明
+## 信号阈值
 
-编辑 `config/settings.yaml`:
+| 评分 | 操作 | 仓位 |
+|------|------|------|
+| ≥55 | 强烈买入 | ≤20% |
+| ≥25 | 买入 | ≤10% |
+| -25~25 | 观望 | 0% |
+| ≤-25 | 卖出 | 减仓 |
+| ≤-55 | 强烈卖出 | 清仓 |
+
+## 配置 (`config/settings.yaml`)
 
 ```yaml
-# 添加自选股
+# 自选股
 watchlist:
   stocks:
     - code: "600519"
       name: "贵州茅台"
+  funds:
+    - code: "510300"
+      name: "沪深300ETF"
 
-# 配置本地大模型 (可选)
-llm:
-  api_base: "http://localhost:11434/v1"  # Ollama
-  model: "qwen2.5"
+# 策略权重
+signal:
+  weights:
+    technical: 0.30
+    capital_flow: 0.15
+    multi_timeframe: 0.15
+    volume_pattern: 0.15
+    trend_strength: 0.10
+    news_sentiment: 0.15
 
-# 配置通知 (至少一个)
+# 通知 (至少配置一个)
 notify:
-  wecom_webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+  wecom_webhook: "https://qyapi.weixin.qq.com/..."
+  dingtalk_webhook: "https://oapi.dingtalk.com/..."
+  serverchan_key: "SCT..."
+  bark_url: ""           # iOS
+
+# 风控
+risk:
+  max_position_pct: 20
+  max_industry_pct: 30
+  consecutive_loss_limit: 3
+
+# LLM (可选)
+llm:
+  enabled: true
+  api_base: "http://localhost:11434/v1"
+  model: "qwen2.5"
 ```
 
-## 信号解读
+## 部署
 
-| 评分 | 操作 | 仓位建议 |
-|------|------|----------|
-| >60 | 强烈买入 | 15-20% |
-| 30~60 | 买入 | 5-15% |
-| -30~30 | 观望 | 0% |
-| -60~-30 | 卖出 | 减仓 |
-| <-60 | 强烈卖出 | 清仓 |
+```bash
+./deploy.sh bg          # screen后台运行
+./deploy.sh stop        # 停止
+./deploy.sh status      # 状态
+./deploy.sh autostart   # 开机自启(launchd)
+
+tail -f logs/monitor.log      # 实时日志
+```
+
+## 数据存储
+
+SQLite (`data/stock_monitor.db`):
+- `kline_data` — K线数据(支持日/60分/15分)
+- `signals` — 信号历史
+- `trades` — 交易记录
+- `positions` — 持仓
+
+## 通知渠道
+
+| 渠道 | 限额 | 配置字段 |
+|------|------|---------|
+| 企业微信 | 无限制 | `wecom_webhook` |
+| 钉钉 | 无限制 | `dingtalk_webhook` |
+| Server酱 | 5次/日 | `serverchan_key` |
+| Bark | 无限制 | `bark_url` |

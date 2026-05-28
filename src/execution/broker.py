@@ -27,6 +27,53 @@ class Broker(ABC):
         ...
 
 
+class RealBroker(Broker):
+    """实盘券商接口基类 - 继承此类实现具体券商对接"""
+
+    def __init__(self):
+        self.trade_store = TradeStore()
+        self._connected = False
+
+    def connect(self) -> bool:
+        raise NotImplementedError
+
+    def buy(self, order: Order) -> OrderResult:
+        raise NotImplementedError
+
+    def sell(self, order: Order) -> OrderResult:
+        raise NotImplementedError
+
+    def get_position(self, code: str) -> Optional[dict]:
+        raise NotImplementedError
+
+    def get_account_balance(self) -> float:
+        raise NotImplementedError
+
+
+class XtQuantBroker(RealBroker):
+    """迅投QMT券商接口 (需安装xtquant)"""
+
+    def connect(self) -> bool:
+        try:
+            from xtquant import xtdata
+            self._connected = True
+            return True
+        except ImportError:
+            return False
+
+    def buy(self, order: Order) -> OrderResult:
+        return OrderResult(success=False, message="未实现: QMT下单需配置交易终端")
+
+    def sell(self, order: Order) -> OrderResult:
+        return OrderResult(success=False, message="未实现: QMT下单需配置交易终端")
+
+    def get_position(self, code: str) -> Optional[dict]:
+        return None
+
+    def get_account_balance(self) -> float:
+        return 0.0
+
+
 class MockBroker(Broker):
     def __init__(self):
         self.trade_store = TradeStore()

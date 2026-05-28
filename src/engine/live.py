@@ -16,6 +16,9 @@ from src.data.manager import DataManager
 from src.strategy.technical import TechnicalStrategy
 from src.strategy.capital_flow import CapitalFlowStrategy
 from src.strategy.news_sentiment import NewsSentimentStrategy
+from src.strategy.multi_timeframe import MultiTimeframeStrategy
+from src.strategy.volume_pattern import VolumePatternStrategy
+from src.strategy.trend_strength import TrendStrengthStrategy
 from src.strategy.ensemble import EnsembleStrategy
 from src.risk.manager import RiskManager
 from src.risk.rules import (
@@ -57,6 +60,9 @@ class LiveEngine:
         strategies = [
             TechnicalStrategy(),
             CapitalFlowStrategy(),
+            MultiTimeframeStrategy(),
+            VolumePatternStrategy(),
+            TrendStrengthStrategy(),
         ]
         if self._llm_enabled:
             strategies.append(NewsSentimentStrategy())
@@ -106,7 +112,12 @@ class LiveEngine:
         code = stock["code"]
         name = stock.get("name", code)
 
-        quote = self.data_manager.get_realtime_quote(code)
+        quote = None
+        for _ in range(3):
+            quote = self.data_manager.get_realtime_quote(code, force_refresh=True)
+            if quote:
+                break
+            time.sleep(3)
         if not quote:
             return None
         price = quote.get("price", 0)
@@ -203,8 +214,9 @@ class LiveEngine:
                 if signal:
                     results.append(signal)
             except Exception as e:
+                import traceback
                 console.print(f"[red]扫描{stock.get('name')}失败: {e}[/red]")
-                log.error(f"扫描{stock.get('name')}失败: {e}")
+                log.error(f"扫描{stock.get('name')}失败: {e}\n{traceback.format_exc()}")
 
         self._display_results(results)
         return results

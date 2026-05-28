@@ -24,7 +24,7 @@ def main():
 
     import argparse
     parser = argparse.ArgumentParser(description="A股量化交易系统")
-    parser.add_argument("--mode", choices=["once", "loop", "web", "backtest"],
+    parser.add_argument("--mode", choices=["once", "loop", "web", "backtest", "optimize"],
                        default="once", help="运行模式")
     parser.add_argument("--interval", type=int, default=5,
                        help="监控间隔(分钟)")
@@ -56,11 +56,39 @@ def main():
                     print(f"  · {r}")
         return
 
+    if args.mode == "optimize":
+        from src.optimization.grid_search import GridSearchOptimizer, ParamGrid
+        watchlist = settings.get_watchlist()
+        codes = [s["code"] for s in watchlist]
+        optimizer = GridSearchOptimizer(codes)
+        results = optimizer.search([
+            ParamGrid("technical", [0.3, 0.4, 0.5, 0.6]),
+            ParamGrid("capital_flow", [0.15, 0.2, 0.25]),
+        ], objective="composite")
+        print("\n" + "=" * 60)
+        print("  参数优化结果 (前10名)")
+        print("=" * 60)
+        for i, r in enumerate(results[:10]):
+            print(f"\n  #{i+1} 得分: {r.score:.2f}")
+            print(f"  参数: {r.params}")
+            print(f"  总收益: {r.result.total_return:.2f}%")
+            print(f"  最大回撤: {r.result.max_drawdown:.2f}%")
+            print(f"  胜率: {r.result.win_rate:.2f}%")
+            print(f"  盈亏比: {r.result.profit_loss_ratio}")
+            print(f"  交易次数: {r.result.total_trades}")
+        return
+
     if args.mode == "backtest":
+        from src.strategy.multi_timeframe import MultiTimeframeStrategy
+        from src.strategy.volume_pattern import VolumePatternStrategy
+        from src.strategy.trend_strength import TrendStrengthStrategy
+
         strategies = [
             TechnicalStrategy(),
             CapitalFlowStrategy(),
-            NewsSentimentStrategy(),
+            MultiTimeframeStrategy(),
+            VolumePatternStrategy(),
+            TrendStrengthStrategy(),
         ]
         ensemble = EnsembleStrategy(strategies)
         risk_manager = RiskManager([

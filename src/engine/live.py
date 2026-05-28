@@ -86,7 +86,20 @@ class LiveEngine:
         ])
 
         self.notifier = Notifier(settings.data)
-        self.broker = MockBroker()
+        broker_type = settings.get("broker.type", "mock")
+        if broker_type == "xtquant":
+            from src.execution.broker import XtQuantBroker
+            self.broker = XtQuantBroker(
+                account_id=settings.get("broker.account_id", ""),
+                password=settings.get("broker.password", ""),
+            )
+            if self.broker.connect():
+                console.print("[bold green]✅ QMT券商连接成功[/bold green]")
+            else:
+                console.print("[yellow]⚠️ QMT未连接,使用模拟券商[/yellow]")
+                self.broker = MockBroker()
+        else:
+            self.broker = MockBroker()
         self.signal_bus = SignalBus(
             risk_manager=self.risk_manager,
             broker=self.broker,

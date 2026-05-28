@@ -51,27 +51,89 @@ class RealBroker(Broker):
 
 
 class XtQuantBroker(RealBroker):
-    """迅投QMT券商接口 (需安装xtquant)"""
+    """迅投QMT券商接口
+
+    需安装: pip install xtquant
+    使用方式:
+        1. 在券商开通QMT权限
+        2. 运行QMT终端，启动量化交易
+        3. xtquant会自动连接QMT终端
+    """
+
+    def __init__(self, account_id: str = "", password: str = ""):
+        super().__init__()
+        self.account_id = account_id
+        self.password = password
 
     def connect(self) -> bool:
         try:
             from xtquant import xtdata
+            xtdata.connect()
             self._connected = True
             return True
         except ImportError:
             return False
+        except Exception:
+            return False
 
     def buy(self, order: Order) -> OrderResult:
-        return OrderResult(success=False, message="未实现: QMT下单需配置交易终端")
+        try:
+            from xtquant import xttrader
+            from xtquant.xttype import StockAccount
+
+            account = StockAccount(self.account_id)
+            # 异步下单，返回订单ID
+            order_id = xttrader.trade.order_stock(
+                account, order.code, 1, order.price, order.volume,
+                quote_type=1, order_type=0,
+            )
+            self.trade_store.save_order(order)
+            return OrderResult(
+                success=True, order_id=order_id,
+                executed_price=order.price, executed_volume=order.volume,
+                message="QMT下单成功",
+            )
+        except ImportError:
+            return OrderResult(success=False, message="需安装xtquant")
+        except Exception as e:
+            return OrderResult(success=False, message=f"QMT下单失败: {e}")
 
     def sell(self, order: Order) -> OrderResult:
-        return OrderResult(success=False, message="未实现: QMT下单需配置交易终端")
+        try:
+            from xtquant import xttrader
+            from xtquant.xttype import StockAccount
+
+            account = StockAccount(self.account_id)
+            order_id = xttrader.trade.order_stock(
+                account, order.code, 2, order.price, order.volume,
+                quote_type=1, order_type=0,
+            )
+            self.trade_store.save_order(order)
+            return OrderResult(
+                success=True, order_id=order_id,
+                executed_price=order.price, executed_volume=order.volume,
+                message="QMT卖单成功",
+            )
+        except ImportError:
+            return OrderResult(success=False, message="需安装xtquant")
+        except Exception as e:
+            return OrderResult(success=False, message=f"QMT卖单失败: {e}")
 
     def get_position(self, code: str) -> Optional[dict]:
-        return None
+        try:
+            from xtquant import xtdata
+            positions = xtdata.get_stock_position(self.account_id, code)
+            return positions
+        except Exception:
+            return None
 
     def get_account_balance(self) -> float:
-        return 0.0
+        try:
+            from xtquant import xtdata
+            balance = xtdata.get_account_balance(self.account_id)
+            return balance.get("available", 0)
+        except Exception:
+            return 0.0
 
 
 class MockBroker(Broker):

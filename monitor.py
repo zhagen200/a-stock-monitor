@@ -288,7 +288,7 @@ class StockMonitor:
         news_score = 0.0
         news_list = []
         if self.llm and self.llm.enabled and stock_code in self.llm_stocks:
-            news_list = self.news_collector.get_stock_news(stock_code, limit=5)
+            news_list = self.news_collector.get_stock_news(stock_code, stock_name, limit=5)
             if news_list:
                 all_titles = "\n".join([f"- {n.get('title', '')}" for n in news_list])
                 analysis = self.llm.analyze_news(all_titles, stock_code)

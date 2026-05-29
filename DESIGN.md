@@ -2,40 +2,28 @@
 
 ## 一、架构设计
 
-### 1.1 四层架构
+### 1.1 系统架构
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        入口层                                │
-│            main.py / start.py / deploy.sh                   │
+│                     主控制台 (monitor.py)                     │
+│              日度节奏调度：推荐→扫描→汇总→休眠               │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │ 数据层    │  │ 策略层    │  │ 风控层    │  │ 执行层    │   │
+│  │ 数据层    │  │ 分析层    │  │ 选股层    │  │ 推送层    │   │
 │  │          │  │          │  │          │  │          │   │
-│  │ collector│  │technical │  │ rules    │  │ broker   │   │
-│  │ manager  │  │capital   │  │ manager  │  │ order    │   │
-│  │ store    │  │multi_tf  │  │          │  │ position │   │
-│  │ cache    │  │volume    │  │          │  │          │   │
-│  │          │  │trend     │  │          │  │          │   │
-│  │          │  │news      │  │          │  │          │   │
-│  │          │  │ensemble  │  │          │  │          │   │
+│  │ collector│  │technical │  │smart_pick│  │ notifier │   │
+│  │ news     │  │signal_eng│  │          │  │ (钉钉等) │   │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
 │       │              │              │              │        │
 │       └──────────────┴──────────────┴──────────────┘        │
 │                              │                               │
 │                    ┌─────────▼─────────┐                    │
-│                    │    信号总线        │                    │
-│                    │   SignalBus       │                    │
-│                    │  策略→风控→通知→执行 │                   │
-│                    └─────────┬─────────┘                    │
-│                              │                               │
-│              ┌───────────────┼───────────────┐              │
-│              ▼               ▼               ▼              │
-│     ┌────────────┐  ┌────────────┐  ┌────────────┐        │
-│     │ 通知推送    │  │ 回测引擎    │  │ Web面板    │        │
-│     │ 4渠道      │  │ 历史验证    │  │ Streamlit  │        │
-│     └────────────┘  └────────────┘  └────────────┘        │
+│                    │   Web 面板        │                    │
+│                    │  (Streamlit)      │                    │
+│                    │  行情/持仓/关注池  │                    │
+│                    └───────────────────┘                    │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -43,20 +31,19 @@
 ### 1.2 数据流
 
 ```
-定时扫描:
-  腾讯API → get_realtime_quote() → 缓存(30s)
-  AKShare  → get_kline()          → SQLite持久化
-  AKShare  → get_fund_flow()      → 缓存(5min)
-  LLM      → analyze_news()       → 情绪评分
+开盘前(09:00):
+  东方财富API → scan_short_term_opportunities() → 推荐TOP10 → 推送
 
-策略处理:
-  strategy.generate(data) → StrategySignal
-  ensemble.generate()     → TradeSignal(加权融合)
+交易时段(09:15-15:00, 每60秒):
+  腾讯API → get_realtime_quote() → 实时行情
+  腾讯API → get_kline()          → K线数据
+  AKShare  → get_fund_flow()     → 资金流向
+  LLM      → analyze_news()      → 新闻情绪(仅持仓股)
+  → signal_engine.generate()     → 信号(买入/卖出/观望)
+  → 买卖信号 → 推送
 
-执行链路:
-  SignalBus.process(signal) → RiskManager.check()
-                            → Notifier.send()
-                            → Broker.execute() (可选)
+收盘后(15:00):
+  大盘指数 + 信号汇总 + 资金流向 → 收盘汇总 → 推送
 ```
 
 ## 二、模块详解
@@ -64,187 +51,160 @@
 ### 2.1 数据层 (`src/data/`)
 
 **collector.py** — 数据采集
-- `get_realtime_quote()` — 腾讯行情API，实时股价
+- `get_realtime_quote()` — 腾讯行情API，实时股价/涨跌幅/成交量/换手率/PE
 - `get_kline()` — 腾讯K线API + AKShare回退，支持日/周/月
-- `get_intraday_kline()` — AKShare分钟K线，支持15/30/60分钟
-- `get_fund_flow()` — 3源回退: AKShare → 东方财富HTTP → 行情估算
-- `get_market_index()` — 大盘指数(上证/深证/创业板)
-- `get_sector_flow()` — 板块资金流向
+- `get_fund_flow()` — 资金流向（主力/超大单/大单/中单/小单）
+- `get_market_index()` — 大盘指数（上证/深证/创业板）
 
-**store.py** — SQLite存储
-- 4表: `kline_data` / `signals` / `trades` / `positions`
-- WAL模式，支持并发读
-- K线按(code, period, date)唯一索引
+**news.py** — 新闻采集
+- 东方财富个股新闻，返回标题+摘要列表
 
-**manager.py** — 统一数据入口
-- 内存缓存(TTL)+DB持久化双层
-- 支持force_refresh强制刷新
+### 2.2 分析层 (`src/analysis/`)
 
-**cache.py** — TTL内存缓存
-- `get_or_set(key, fn, ttl)` 模式
+**technical.py** — 技术分析器
+- MA排列（多头/空头/纠缠）
+- MACD金叉死叉 + 柱状图方向
+- RSI超买超卖（4档区间）
+- KDJ金叉死叉 + J值超限
+- 布林带支撑/压力
+- K线形态（锤子线/吞没/十字星）
+- 综合评分范围: -45 ~ +45
 
-### 2.2 策略层 (`src/strategy/`)
+**signal_engine.py** — 多因子信号融合
+- 技术分析(40%) + 资金流向(20%) + 新闻情绪(25%) + 基本面(15%)
+- 输出: TradeSignal(code, name, price, action, score, confidence, stop_loss, take_profit, reasons)
 
-**BaseStrategy** — 抽象基类
-```python
-class BaseStrategy(ABC):
-    name: str
-    weight: float
-    generate(data: Dict) -> StrategySignal
-    get_required_data() -> List[str]
+### 2.3 选股层 (`src/scanner/`)
+
+**smart_picker.py** — 智能选股
+- 数据源: 东方财富Web API（直接HTTP调用，绕过akshare代理问题）
+- `get_sector_fund_flow(count)` — 板块资金流向TOP N
+- `get_stock_fund_flow_top(count)` — 个股资金流入TOP N
+- `scan_short_term_opportunities(max_count)` — 短线机会扫描
+- `generate_daily_report()` — 每日资金流向报表
+
+选股策略:
+```
+1. 主力资金净流入 > 1000万
+2. 涨幅 2%~8%（不追涨停）
+3. 排除ST股、停牌股
+4. 评分: 涨幅3%~6% +20, 净流入>1亿 +30, >5000万 +20, >1000万 +10
+5. 取TOP10
 ```
 
-**TechnicalStrategy** — 技术分析 (权重0.30)
-- 趋势评分(±50): MA排列4档 + MACD金叉死叉 + MACD柱方向 + MA20偏离
-- 动量评分(±30): RSI 4档区间 + KDJ金叉死叉 + J值超限
-- 量能评分(±20): 放量上涨/下跌 + 量能趋势
-- 市场状态调节: bull×1.0 / oscillate×0.9 / bear×0.7
-- soft归一化: score×1.5 → clip(-100,100)
+### 2.4 推送层 (`src/notify/`)
 
-**CapitalFlowStrategy** — 资金流向 (权重0.15)
-- 主力净流入额/占比评分
+**notifier.py** — 多渠道推送
+- 钉钉群机器人（Markdown消息，免费无限制）
+- Server酱（微信推送）
+- 企业微信机器人
+- Bark（iOS推送）
+- 推送内容: 买卖信号、每日推荐、收盘汇总、资金流向报表
 
-**MultiTimeframeStrategy** — 多时间框架 (权重0.15)
-- 日线/60分/15分趋势方向一致性检查
-- 三周期同向: +30分; 两周期同向: +15分
-- 短线斜率修正
+### 2.5 Web面板 (`src/web/`)
 
-**VolumePatternStrategy** — 成交量形态 (权重0.15)
-- 缩量见底 + 量价齐升 + 放量滞涨 + 量价背离 + 底部放量
+**dashboard.py** — Streamlit界面
+- 📈 行情分析: 选择股票查看K线、技术指标、资金流向、持仓盈亏
+- 💼 持仓管理: 添加/编辑成本数量/全部卖出/删除
+- 👁️ 关注池: 手动添加/移除，查看来源（手动/智能推荐）
 
-**TrendStrengthStrategy** — 趋势强度 (权重0.10)
-- ADX > 25判断强趋势
-- DMI方向判断
-- 布林带上下轨支撑/压力
-- 连续阴阳线计数
+**portfolio.py** — 持仓数据管理
+- JSON文件存储（data/holdings.json, data/watch_pool.json）
+- CRUD操作: add_holding, update_holding, sell_holding, delete_holding
+- 关注池: add_to_watch, remove_from_watch
+- 与 monitor.py 动态池联动
 
-**NewsSentimentStrategy** — 新闻情绪 (权重0.15, 需LLM)
-- LLM分析新闻标题情感
-- 返回±100评分
+### 2.6 主程序 (`monitor.py`)
 
-**EnsembleStrategy** — 集成引擎
-- 遍历所有策略，加权累加
-- 权重归一化: 最终评分 / 总权重
-- 置信度: 策略方向一致时提升20%
-- 仓位: strong_buy ≤20%, buy ≤10%
+**StockMonitor** — 日度节奏控制
 
-### 2.3 风控层 (`src/risk/`)
-
-**规则链 (可组合)**
-
-| 规则 | 作用 | 参数 |
+| 时段 | 方法 | 行为 |
 |------|------|------|
-| PositionLimitRule | 单股/行业仓位上限 | max_single_pct, max_industry_pct |
-| MarketRegimeFilter | 熊市过滤买入信号 | — |
-| ConsecutiveLossRule | 连续亏损暂停交易 | max_losses |
-| VolatilityRule | 高波动率过滤 | — |
+| 08:50-09:15 | `daily_recommend()` | 智能选股推荐TOP10，推送 |
+| 09:15-11:30 | `scan_all()` | 每60秒扫描，买卖信号推送 |
+| 11:30-13:00 | 休眠 | `_sleep_until(13, 0)` |
+| 13:00-15:00 | `scan_all()` | 每60秒扫描，买卖信号推送 |
+| 15:00-15:15 | `closing_summary()` | 当日汇总+资金流向+后续关注，推送 |
+| 15:15-次日 | 休眠 | `_sleep_until(次日8:50)` |
+| 周末/假日 | 休眠 | 跳过全天 |
 
-### 2.4 执行层 (`src/execution/`)
+动态监控池管理:
+- `_cleanup_dynamic_pool()`: 推荐股票超过3天自动移除
+- 持仓股永不自动移除
+- 关注池通过Web面板手动管理
 
-**OrderFactory** — 订单工厂
-- `create_market_order()` — 市价单
-- `create_limit_order()` — 限价单
+## 三、数据存储
 
-**Broker接口** — 可替换券商实现
-- `MockBroker` — 模拟交易(0.025%佣金)
-- `RealBroker` — 实盘抽象基类
-- `XtQuantBroker` — 迅投QMT对接桩
+```
+data/
+├── holdings.json       # 持仓 [{code, name, cost, shares, added_at, updated_at}]
+└── watch_pool.json     # 关注池 [{code, name, source, reason, added_at}]
 
-**PositionManager** — 持仓管理
-- 增删改查 + 市值实时更新
-
-### 2.5 核心层 (`src/core/`)
-
-**base.py** — 数据类定义
-- `TradeSignal` — 综合交易信号
-- `StrategySignal` — 单个策略信号
-- `Order` — 订单
-- `Position` — 持仓
-- `BacktestResult` — 回测结果
-
-**config.py** — 配置管理
-- YAML文件读取，`.`号路径访问
-- `settings.get("signal.weights.technical")`
-
-### 2.6 引擎层 (`src/engine/`)
-
-**SignalBus** — 信号总线
-1. 接收信号 → 2. 风控检查 → 3. 入库 → 4. 通知推送 → 5. 回调
-
-**BacktestEngine** — 回测引擎
-- 预加载数据 → 逐日回放
-- 信号生成 → 风控检查 → 模拟交易
-- 绩效计算: 收益率/夏普/最大回撤/胜率/盈亏比
-
-**LiveEngine** — 实盘引擎
-- 盘中扫描 + ATR止盈止损 + 大盘状态
-- LLM新闻分析(持仓股)
-
-### 2.7 优化层 (`src/optimization/`)
-
-**GridSearchOptimizer** — 网格搜索
-- `ParamGrid`定义参数空间
-- `product()`笛卡尔积搜索
-- 支持4种目标函数: sharpe / total_return / win_rate / composite
-
-## 三、通知推送
-
-| 渠道 | 方式 | 限制 |
-|------|------|------|
-| 企业微信 | Webhook机器人(Markdown) | 无 |
-| 钉钉 | Webhook机器人(Markdown) | 无 |
-| Server酱 | API推送 | 5次/日 |
-| Bark | HTTP GET | 无 |
-
-推送策略: 仅非`hold`信号触发通知，避免骚扰。
-
-## 四、部署
-
-### 4.1 后台运行
-```bash
-./deploy.sh bg          # screen后台
-./deploy.sh stop        # 停止
-./deploy.sh autostart   # launchd开机自启
+logs/
+├── monitor.log         # 运行日志（Python logging, 纯文本）
+├── watchlist_pool.json # 动态监控池（推荐股票, 3天过期）
+└── push_counter.db     # 推送次数计数（SQLite）
 ```
 
-### 4.2 launchd自启
-Plist: `~/Library/LaunchAgents/com.astock.monitor.plist`
-- `RunAtLoad`: 登录时启动
-- `KeepAlive`: 崩溃后重启
-- `ThrottleInterval`: 30秒重试间隔
+## 四、配置文件
 
-## 五、配置文件
-
-`config/settings.yaml` (被.gitignore保护，不提交密钥)
+`config/settings.yaml`（.gitignore保护）
 
 ```yaml
-llm:          # LLM配置
-notify:       # 4个通知渠道
-schedule:     # 扫描间隔
-signal:       # 信号阈值 + 6策略权重
-risk:         # 风控参数
-backtest:     # 回测资金/佣金
-watchlist:    # 自选股(stocks + funds)
+watchlist:     # 自选股(stocks + funds)
+llm:           # LLM配置(api_base, model, api_key, enabled)
+notify:        # 推送渠道(dingtalk_webhook, serverchan_key)
+signal:        # 信号阈值 + 权重
+schedule:      # 扫描间隔
 ```
 
-## 六、SQLite Schema
+## 五、外部依赖
 
-```sql
-kline_data(code, period, date, open, close, high, low, volume)
-signals(id, code, name, timestamp, action, score, price,
-        technical_score, capital_score, news_score, ...)
-trades(id, code, name, direction, price, volume, amount, timestamp, fee)
-positions(code, name, volume, cost_price, current_price, profit_pct, ...)
+### 数据源
+
+| 数据 | 来源 | 方式 |
+|------|------|------|
+| 实时行情 | 腾讯行情API | HTTP GET |
+| K线数据 | 腾讯K线API + AKShare回退 | HTTP GET |
+| 资金流向 | AKShare | Python库调用 |
+| 新闻 | 东方财富 | 网页抓取 |
+| 板块/个股资金流向TOP | 东方财富Web API | 直接HTTP（trust_env=False绕过代理） |
+| LLM新闻分析 | MiMo API (OpenAI兼容) | HTTP POST |
+
+### Python依赖
+
 ```
-
-## 七、依赖
-
-```
-akshare >= 1.14    # A股数据
+akshare >= 1.14     # A股数据
 pandas >= 2.0       # 数据处理
 requests            # HTTP
 rich                # CLI输出
 pyyaml              # 配置
 openai              # LLM客户端
-streamlit           # Web面板(可选)
+streamlit           # Web面板
+plotly              # 图表
+```
+
+## 六、信号评分体系
+
+### 技术分析评分 (-45 ~ +45)
+
+| 指标 | 多头加分 | 空头减分 |
+|------|----------|----------|
+| MA排列 | 多头+10, 偏多+5 | 空头-10, 偏空-5 |
+| MACD | 金叉+8, 红柱放大+5 | 死叉-8, 绿柱放大-5 |
+| RSI | 超卖(<30)+8, 偏低+4 | 超买(>70)-8, 偏高-4 |
+| KDJ | 金叉+6 | 死叉-6 |
+| 布林带 | 下轨支撑+4 | 上轨压力-4 |
+| K线形态 | 锤子线/吞没+5 | 十字星/吊颈线-5 |
+
+### 多因子融合
+
+```
+综合评分 = 技术×40% + 资金×20% + 新闻×25% + 基本面×15%
+
+≥ 60   → 🔴 强烈买入 (推送)
+30~60  → 🟠 买入 (推送)
+-30~30 → ⚪ 观望 (不推送)
+-60~-30→ 🟢 卖出 (推送)
+≤ -60  → 🔵 强烈卖出 (推送)
 ```

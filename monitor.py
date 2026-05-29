@@ -123,6 +123,8 @@ class StockMonitor:
         self._closing_done = False
         self._evolution_done = False
         self._today_signals = []
+        self._scan_tracker = {}   # {code: last_scan_timestamp}
+        self._last_prices = {}    # {code: (price, timestamp)}
 
     def _load_config(self, path: str) -> dict:
         try:
@@ -397,6 +399,27 @@ class StockMonitor:
                 codes.append({"code": code, "name": info.get("name", code), "source": "auto"})
         return codes
 
+    def _build_scan_tiers(self) -> dict:
+        """构建分层扫描配置: {code -> {interval: 秒, group: 名称}}"""
+        tiers = {}
+        stocks = self.watchlist.get("stocks", [])
+        funds = self.watchlist.get("funds", [])
+
+        for i, s in enumerate(stocks):
+            code = s["code"]
+            if code in self.holding_codes:
+                tiers[code] = {"interval": 15, "group": "holding"}
+            elif i < 5:
+                tiers[code] = {"interval": 30, "group": "core"}
+            else:
+                tiers[code] = {"interval": 60, "group": "normal"}
+
+        for f in funds:
+            tiers[f["code"]] = {"interval": 120, "group": "etf"}
+
+        tiers["_default"] = {"interval": 120, "group": "dynamic"}
+        return tiers
+
     # ── 收盘汇总 + 收益回填 ──────────────────────────
 
     def closing_summary(self):
@@ -635,19 +658,31 @@ class StockMonitor:
 
         ai_status = "✅ 多模型" if self.ai_enabled and len(self.llm_depot.models) > 1 else "✅ 单模型" if self.ai_enabled else "❌"
         console.print("[bold green]🚀 A股监控系统 v3 启动[/bold green]")
-        console.print(f"   扫描间隔: {interval_seconds}秒")
+        console.print(f"   分层扫描: 持仓15s/核心30s/普通60s/ETF120s/动态120s")
         console.print(f"   持仓: {len(self.holding_codes)}只")
         console.print(f"   AI分析: {ai_status}")
         console.print(f"   策略进化: {'✅' if self.ai_evolution else '❌'}")
         console.print(f"   推送: 钉钉 ✅ | Server酱 ✅\n")
 
-        log.info(f"🚀 v3启动 | 间隔:{interval_seconds}秒 | AI:{ai_status} | 持仓:{len(self.holding_codes)}只")
+        log.info(f"🚀 v3启动 | 分层扫描 | AI:{ai_status} | 持仓:{len(self.holding_codes)}只")
 
         # 启动时立即回填历史信号收益（昨天及更早的数据）
         try:
             self._backfill_returns()
         except Exception as e:
             log.warning(f"启动回填收益失败: {e}")
+
+        # 分层扫描初始化
+        scan_tracker = {}
+        last_prices = {}
+        all_codes = []
+        for s in self.watchlist.get("stocks", []):
+            all_codes.append(s)
+        for code, info in self.dynamic_pool.items():
+            if not any(s["code"] == code for s in all_codes):
+                all_codes.append({"code": code, "name": info.get("name", code)})
+        for f in self.watchlist.get("funds", []):
+            all_codes.append(f)
 
         while self.running:
             try:
@@ -681,14 +716,66 @@ class StockMonitor:
                     continue
 
                 if phase in ('morning', 'afternoon'):
-                    self.scan_all()
-                    if self.running:
-                        next_t = datetime.now() + timedelta(seconds=interval_seconds)
-                        console.print(f"\n[dim]⏰ 下次扫描: {next_t.strftime('%H:%M:%S')}[/dim]")
-                        for _ in range(interval_seconds):
-                            if not self.running:
-                                break
-                            time.sleep(1)
+                    now = time.time()
+                    tiers = self._build_scan_tiers()
+
+                    # 1. 按分层间隔筛选到期的股票
+                    due_stocks = []
+                    for stock in all_codes:
+                        code = stock["code"]
+                        tier = tiers.get(code, tiers["_default"])
+                        last = scan_tracker.get(code, 0)
+                        if now - last >= tier["interval"]:
+                            due_stocks.append(stock)
+
+                    # 2. 价格波动触发（持仓股快速响应）
+                    move_alerts = []
+                    for code in self.holding_codes:
+                        if code in last_prices and code not in {s["code"] for s in due_stocks}:
+                            old_price, old_time = last_prices[code]
+                            if now - old_time >= 5:
+                                try:
+                                    quote = self.collector.get_realtime_quote(code)
+                                    if quote and old_price > 0:
+                                        move = abs(quote["price"] - old_price) / old_price
+                                        if move >= 0.005:
+                                            name = next((s.get("name", code) for s in all_codes if s["code"] == code), code)
+                                            due_stocks.append({"code": code, "name": name})
+                                            move_alerts.append(f"{name} {move*100:.2f}%")
+                                except Exception:
+                                    pass
+                    if move_alerts:
+                        log.info(f"⚡ 价格波动触发: {' | '.join(move_alerts)}")
+
+                    # 3. 扫描到期的标的
+                    if due_stocks:
+                        groups = {}
+                        for s in due_stocks:
+                            g = tiers.get(s["code"], tiers["_default"])["group"]
+                            groups.setdefault(g, []).append(s["name"])
+                        log.info(f"扫描 {len(due_stocks)} 只: " + " | ".join(f"{g}[{','.join(n[:4] for n in ns)}]" for g, ns in groups.items()))
+
+                        results = []
+                        for stock in due_stocks:
+                            code = stock["code"]
+                            scan_tracker[code] = now
+                            result = self.scan_stock(code, stock["name"])
+                            if result:
+                                results.append(result)
+                                self._today_signals.append(result)
+                                if result.get("signal") and result["signal"].action in ("strong_buy", "strong_sell", "buy", "sell"):
+                                    self.notifier.send_signal(result["signal"])
+                                if result.get("quote"):
+                                    last_prices[code] = (result["quote"]["price"], now)
+                        if results:
+                            self._display_results(results)
+                            self._log_results(results)
+
+                    # 4. 5秒心跳
+                    for _ in range(5):
+                        if not self.running:
+                            break
+                        time.sleep(1)
 
                 elif phase == 'noon_break':
                     self._sleep_until(13, 0, "午间休市")
@@ -709,6 +796,22 @@ class StockMonitor:
 
 
 def main():
+    # ── PID 文件防多实例 ──
+    PID_FILE = "/tmp/astock_monitor.pid"
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE) as f:
+            try:
+                old_pid = int(f.read().strip())
+                # 检查旧进程是否存活
+                os.kill(old_pid, 0)
+                log.error(f"monitor 已在运行 (PID={old_pid})，退出")
+                print(f"monitor 已在运行 (PID={old_pid})，退出", file=sys.stderr)
+                sys.exit(1)
+            except (ProcessLookupError, ValueError):
+                pass  # 旧进程已死，继续
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
     import argparse
     parser = argparse.ArgumentParser(description="A股智能量化监控系统 v3")
     parser.add_argument("--config", default="config/settings.yaml")
@@ -741,6 +844,12 @@ def main():
         monitor.scan_all()
     else:
         monitor.run_loop(args.interval)
+
+    # 清理 PID 文件
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

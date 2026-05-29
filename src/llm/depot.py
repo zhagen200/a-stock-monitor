@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+import ssl
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -15,6 +16,19 @@ from openai import OpenAI
 from rich.console import Console
 
 console = Console()
+
+# ── SSL 证书修复：使用 certifi 的 CA bundle ──
+try:
+    import certifi
+    ssl_cert_file = certifi.where()
+    os.environ.setdefault('SSL_CERT_FILE', ssl_cert_file)
+    os.environ.setdefault('REQUESTS_CA_BUNDLE', ssl_cert_file)
+except ImportError:
+    # 降级到系统证书
+    for p in ['/etc/ssl/cert.pem', '/private/etc/ssl/cert.pem']:
+        if os.path.exists(p):
+            os.environ.setdefault('SSL_CERT_FILE', p)
+            break
 
 # 自动加载 ~/.hermes/.env
 _hermes_env = Path.home() / '.hermes' / '.env'
@@ -69,10 +83,10 @@ class LLMDepot:
         self._load_models()
 
     def _resolve_env(self, value: str) -> str:
-        """解析配置中的 ${ENV_VAR} 占位符"""
+        """解析配置中的 ${ENV_VAR} 占位符，未设置则返回空字符串"""
         def _replace(m):
             var_name = m.group(1)
-            return os.environ.get(var_name) or m.group(0)
+            return os.environ.get(var_name, "")
         return re.sub(r'\$\{(\w+)\}', _replace, value)
 
     def _load_models(self):

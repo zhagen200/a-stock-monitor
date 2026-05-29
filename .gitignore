@@ -26,3 +26,6 @@ config/settings.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# Temp/debug scripts
+_*.py

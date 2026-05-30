@@ -14,7 +14,7 @@ from rich.console import Console
 
 console = Console()
 
-DB_PATH = Path(__file__).parent.parent.parent / "data" / "backtest.db"
+from src.data.store import DB_PATH, get_conn
 
 
 @dataclass
@@ -62,95 +62,20 @@ class EvolutionRecord:
 
 
 class BacktestDB:
-    """回测数据库"""
+    """回测数据库（使用统一数据库 stock_monitor.db）"""
 
     def __init__(self):
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(DB_PATH))
-        self._init_tables()
+        # 表已在 store.py 的 init_database() 中统一创建
+        pass
 
-    def _init_tables(self):
-        """初始化表结构"""
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                code TEXT NOT NULL,
-                name TEXT NOT NULL,
-                action TEXT NOT NULL,
-                score REAL,
-                price REAL,
-                ai_analysis TEXT,
-                ai_confidence REAL,
-                -- 技术指标快照
-                technical_score REAL,
-                capital_score REAL,
-                news_score REAL,
-                -- 实际收益（后续回填）
-                actual_return_1d REAL DEFAULT 0,
-                actual_return_3d REAL DEFAULT 0,
-                actual_return_5d REAL DEFAULT 0,
-                actual_return_10d REAL DEFAULT 0,
-                max_drawdown REAL DEFAULT 0,
-                -- 归因
-                correct_factors TEXT DEFAULT '[]',
-                wrong_factors TEXT DEFAULT '[]',
-                lesson_learned TEXT DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS backtest_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                total_signals INTEGER,
-                buy_signals INTEGER,
-                sell_signals INTEGER,
-                accuracy_1d REAL,
-                accuracy_3d REAL,
-                accuracy_5d REAL,
-                avg_return_1d REAL,
-                avg_return_3d REAL,
-                avg_return_5d REAL,
-                sharpe_ratio REAL,
-                max_drawdown REAL,
-                win_rate REAL,
-                -- AI评估
-                ai_evaluation TEXT,
-                key_insights TEXT DEFAULT '[]',
-                created_at TEXT DEFAULT (datetime('now','localtime'))
-            );
-
-            CREATE TABLE IF NOT EXISTS strategy_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                version INTEGER NOT NULL,
-                params TEXT NOT NULL,
-                accuracy REAL,
-                sharpe_ratio REAL,
-                reason TEXT,
-                created_at TEXT DEFAULT (datetime('now','localtime'))
-            );
-
-            CREATE TABLE IF NOT EXISTS evolution_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                old_params TEXT,
-                new_params TEXT,
-                accuracy_before REAL,
-                accuracy_after REAL,
-                ai_reasoning TEXT,
-                key_changes TEXT DEFAULT '[]'
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_signals_code ON signals(code);
-            CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_signals_action ON signals(action);
-        """)
-        self.conn.commit()
+    def _get_conn(self):
+        return get_conn()
 
     def save_signal(self, signal_data: dict, ai_analysis: str = "",
                     ai_confidence: float = 0) -> int:
         """保存信号记录"""
-        cur = self.conn.execute("""
+        conn = self._get_conn()
+        cur = conn.execute("""
             INSERT INTO signals (timestamp, code, name, action, score, price,
                                 ai_analysis, ai_confidence, technical_score,
                                 capital_score, news_score)
@@ -168,12 +93,15 @@ class BacktestDB:
             signal_data.get('capital_score', 0),
             signal_data.get('news_score', 0),
         ))
-        self.conn.commit()
-        return cur.lastrowid
+        conn.commit()
+        row_id = cur.lastrowid
+        conn.close()
+        return row_id
 
     def update_actual_returns(self, signal_id: int, returns: dict):
         """回填实际收益"""
-        self.conn.execute("""
+        conn = self._get_conn()
+        conn.execute("""
             UPDATE signals SET
                 actual_return_1d = ?, actual_return_3d = ?,
                 actual_return_5d = ?, actual_return_10d = ?,
@@ -184,17 +112,20 @@ class BacktestDB:
             returns.get('return_5d', 0), returns.get('return_10d', 0),
             returns.get('max_drawdown', 0), signal_id,
         ))
-        self.conn.commit()
+        conn.commit()
+        conn.close()
 
     def get_pending_signals(self, days: int = 7) -> List[Dict]:
         """获取需要回填收益的信号"""
+        conn = self._get_conn()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        rows = self.conn.execute("""
+        rows = conn.execute("""
             SELECT id, code, name, action, score, price, timestamp
             FROM signals
             WHERE timestamp > ? AND actual_return_1d = 0
             ORDER BY timestamp DESC
         """, (cutoff,)).fetchall()
+        conn.close()
 
         return [
             {"id": r[0], "code": r[1], "name": r[2], "action": r[3],
@@ -204,8 +135,9 @@ class BacktestDB:
 
     def get_signal_stats(self, days: int = 30) -> Dict:
         """获取信号统计"""
+        conn = self._get_conn()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        rows = self.conn.execute("""
+        rows = conn.execute("""
             SELECT action,
                    COUNT(*) as total,
                    AVG(CASE WHEN actual_return_1d > 0 THEN 1 ELSE 0 END) as accuracy_1d,
@@ -216,6 +148,7 @@ class BacktestDB:
             WHERE timestamp > ? AND actual_return_1d != 0
             GROUP BY action
         """, (cutoff,)).fetchall()
+        conn.close()
 
         stats = {}
         for r in rows:
@@ -227,7 +160,8 @@ class BacktestDB:
 
     def save_backtest_result(self, result: dict):
         """保存每日回测结果"""
-        self.conn.execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT INTO backtest_results (date, total_signals, buy_signals, sell_signals,
                                          accuracy_1d, accuracy_3d, accuracy_5d,
                                          avg_return_1d, avg_return_3d, avg_return_5d,
@@ -248,29 +182,33 @@ class BacktestDB:
             result.get('ai_evaluation', ''),
             json.dumps(result.get('key_insights', []), ensure_ascii=False),
         ))
-        self.conn.commit()
+        conn.commit()
+        conn.close()
 
     def save_strategy_version(self, params: dict, accuracy: float = 0,
                               sharpe: float = 0, reason: str = ""):
         """保存策略版本"""
-        # 获取当前最大版本号
-        max_ver = self.conn.execute(
+        conn = self._get_conn()
+        max_ver = conn.execute(
             "SELECT MAX(version) FROM strategy_versions"
         ).fetchone()[0] or 0
 
-        self.conn.execute("""
+        conn.execute("""
             INSERT INTO strategy_versions (version, params, accuracy, sharpe_ratio, reason)
             VALUES (?, ?, ?, ?, ?)
         """, (max_ver + 1, json.dumps(params, ensure_ascii=False), accuracy, sharpe, reason))
-        self.conn.commit()
+        conn.commit()
+        conn.close()
         return max_ver + 1
 
     def get_latest_strategy(self) -> Optional[Dict]:
         """获取最新策略参数"""
-        row = self.conn.execute("""
+        conn = self._get_conn()
+        row = conn.execute("""
             SELECT version, params, accuracy, sharpe_ratio, reason, created_at
             FROM strategy_versions ORDER BY version DESC LIMIT 1
         """).fetchone()
+        conn.close()
 
         if row:
             return {
@@ -282,7 +220,8 @@ class BacktestDB:
 
     def save_evolution_log(self, record: dict):
         """保存进化记录"""
-        self.conn.execute("""
+        conn = self._get_conn()
+        conn.execute("""
             INSERT INTO evolution_log (timestamp, version, old_params, new_params,
                                       accuracy_before, accuracy_after, ai_reasoning, key_changes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -296,10 +235,12 @@ class BacktestDB:
             record.get('ai_reasoning', ''),
             json.dumps(record.get('key_changes', []), ensure_ascii=False),
         ))
-        self.conn.commit()
+        conn.commit()
+        conn.close()
 
     def close(self):
-        self.conn.close()
+        """兼容旧接口，无需操作"""
+        pass
 
 
 class StrategyEvolver:

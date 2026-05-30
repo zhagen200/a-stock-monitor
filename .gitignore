@@ -23,6 +23,10 @@ config/settings.yaml
 *.swp
 *.swo
 
+# Build
+*.egg-info/
+src/*.egg-info/
+
 # OS
 .DS_Store
 Thumbs.db

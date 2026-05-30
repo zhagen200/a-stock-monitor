@@ -65,6 +65,29 @@ class StockDataCollector:
             if len(data) < 50:
                 return {}
 
+            # 解析盘口数据（买卖五档）
+            def _tf(v, default=0):
+                try: return float(v.strip()) if v and v.strip() else default
+                except: return default
+
+            bids, asks = [], []
+            if len(data) >= 30:
+                b1p = _tf(data[11])
+                # 检测格式: [18]/[19] 若价格>买一价, 则卖一始于[18]
+                sell_start = 18 if _tf(data[19]) > b1p else 20
+                for i in range(5):
+                    idx = 10 + i*2
+                    if idx + 1 < len(data):
+                        p, v = _tf(data[idx+1]), _tf(data[idx])
+                        if p > 0 and (sell_start != 18 or idx < sell_start):
+                            bids.append({"price": p, "volume": v})
+                for i in range(5):
+                    idx = sell_start + i*2
+                    if idx + 1 < len(data):
+                        p, v = _tf(data[idx+1]), _tf(data[idx])
+                        if p > 0:
+                            asks.append({"price": p, "volume": v})
+
             return {
                 "code": stock_code,
                 "name": data[1].strip(),
@@ -72,7 +95,7 @@ class StockDataCollector:
                 "pre_close": float(data[4]) if data[4] else 0,
                 "open": float(data[5]) if data[5] else 0,
                 "volume": float(data[6]) if data[6] else 0,
-                "amount": float(data[37]) if data[37] else 0,
+                "amount": float(data[37]) * 10000 if data[37] else 0,
                 "high": float(data[33]) if data[33] else float(data[3] or 0),
                 "low": float(data[34]) if data[34] else float(data[3] or 0),
                 "change_pct": float(data[32]) if data[32] else 0,
@@ -82,6 +105,8 @@ class StockDataCollector:
                 "pb_ratio": float(data[46]) if data[46] else 0,
                 "total_mv": float(data[45]) if data[45] else 0,
                 "circ_mv": float(data[44]) if data[44] else 0,
+                "bids": bids,
+                "asks": asks,
                 "timestamp": datetime.now().isoformat(),
             }
         except Exception as e:

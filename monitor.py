@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-A股智能量化监控系统 v3
-AI多模型协作 + 策略自进化 + 回测数据存储
+A股智能量化监控系统 v3 [已弃用 - 请使用 main.py]
 
-日度节奏:
-  08:50-09:15  每日推荐（智能选股，AI推理，推送到钉钉/微信）
-  09:15-11:30  上午盘实时监控（60秒/次，AI信号分析，买卖推送）
-  11:30-13:00  午间休市休眠
-  13:00-15:00  下午盘实时监控（60秒/次，AI信号分析，买卖推送）
-  15:00-15:15  收盘汇总（AI总结+资金流向+后续关注点推送）
-  15:15-次日   休眠至下一个交易日（周日执行策略进化）
+⚠️ 此文件已弃用，请使用新入口:
+   python main.py --mode once    # 执行一次扫描
+   python main.py --mode loop    # 持续监控
+   python main.py --mode web     # 启动Web面板
+   python main.py --mode backtest # 回测
+
+旧系统功能已整合到 main.py + src/engine/ + src/strategy/ 架构中。
+保留此文件仅为向后兼容。
 """
 
 import sys

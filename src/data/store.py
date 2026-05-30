@@ -40,7 +40,18 @@ def init_database():
             stop_loss REAL, take_profit_1 REAL, take_profit_2 REAL,
             reasons TEXT,
             strategy_name TEXT DEFAULT '',
-            is_backtest INTEGER DEFAULT 0
+            is_backtest INTEGER DEFAULT 0,
+            -- 回测扩展列（原 backtest.db 迁入）
+            ai_analysis TEXT DEFAULT '',
+            ai_confidence REAL DEFAULT 0,
+            actual_return_1d REAL DEFAULT 0,
+            actual_return_3d REAL DEFAULT 0,
+            actual_return_5d REAL DEFAULT 0,
+            actual_return_10d REAL DEFAULT 0,
+            max_drawdown REAL DEFAULT 0,
+            correct_factors TEXT DEFAULT '',
+            wrong_factors TEXT DEFAULT '',
+            lesson_learned TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +77,66 @@ def init_database():
         CREATE INDEX IF NOT EXISTS idx_signals_code ON signals(code);
         CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_code ON trades(code);
+
+        -- 回测相关表（原 backtest.db 迁入）
+        CREATE TABLE IF NOT EXISTS backtest_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            total_signals INTEGER,
+            buy_signals INTEGER,
+            sell_signals INTEGER,
+            accuracy_1d REAL,
+            accuracy_3d REAL,
+            accuracy_5d REAL,
+            avg_return_1d REAL,
+            avg_return_3d REAL,
+            avg_return_5d REAL,
+            sharpe_ratio REAL,
+            max_drawdown REAL,
+            win_rate REAL,
+            ai_evaluation TEXT,
+            key_insights TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS strategy_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version INTEGER,
+            params TEXT,
+            accuracy REAL,
+            sharpe_ratio REAL,
+            reason TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS evolution_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            version INTEGER,
+            old_params TEXT,
+            new_params TEXT,
+            accuracy_before REAL,
+            accuracy_after REAL,
+            ai_reasoning TEXT,
+            key_changes TEXT
+        );
+
+        -- 持仓表（从 holdings.json 迁入）
+        CREATE TABLE IF NOT EXISTS holdings (
+            code TEXT PRIMARY KEY,
+            name TEXT,
+            cost REAL NOT NULL DEFAULT 0,
+            shares INTEGER NOT NULL DEFAULT 0,
+            added_at TEXT,
+            updated_at TEXT
+        );
+
+        -- 关注池表（从 watch_pool.json 迁入）
+        CREATE TABLE IF NOT EXISTS watch_pool (
+            code TEXT PRIMARY KEY,
+            name TEXT,
+            source TEXT DEFAULT 'manual',
+            reason TEXT DEFAULT '',
+            added_at TEXT
+        );
     """)
     conn.commit()
     conn.close()
@@ -239,6 +310,89 @@ class PositionStore:
     def get_position(self, code: str) -> Optional[dict]:
         conn = get_conn()
         cur = conn.execute("SELECT * FROM positions WHERE code=?", (code,))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+
+class HoldingsStore:
+    """持仓管理（SQLite版，替代 holdings.json）"""
+
+    def get_all(self) -> List[dict]:
+        conn = get_conn()
+        cur = conn.execute("SELECT * FROM holdings ORDER BY code")
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.close()
+        return rows
+
+    def add(self, code: str, name: str, cost: float, shares: int):
+        conn = get_conn()
+        now = datetime.now().isoformat()
+        conn.execute(
+            """INSERT OR REPLACE INTO holdings (code, name, cost, shares, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (code, name, cost, shares, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def update(self, code: str, cost: float = None, shares: int = None):
+        conn = get_conn()
+        now = datetime.now().isoformat()
+        if cost is not None and shares is not None:
+            conn.execute("UPDATE holdings SET cost=?, shares=?, updated_at=? WHERE code=?",
+                         (cost, shares, now, code))
+        elif cost is not None:
+            conn.execute("UPDATE holdings SET cost=?, updated_at=? WHERE code=?", (cost, now, code))
+        elif shares is not None:
+            conn.execute("UPDATE holdings SET shares=?, updated_at=? WHERE code=?", (shares, now, code))
+        conn.commit()
+        conn.close()
+
+    def delete(self, code: str):
+        conn = get_conn()
+        conn.execute("DELETE FROM holdings WHERE code=?", (code,))
+        conn.commit()
+        conn.close()
+
+    def get(self, code: str) -> Optional[dict]:
+        conn = get_conn()
+        cur = conn.execute("SELECT * FROM holdings WHERE code=?", (code,))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+
+class WatchPoolStore:
+    """关注池管理（SQLite版，替代 watch_pool.json）"""
+
+    def get_all(self) -> List[dict]:
+        conn = get_conn()
+        cur = conn.execute("SELECT * FROM watch_pool ORDER BY added_at DESC")
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.close()
+        return rows
+
+    def add(self, code: str, name: str, source: str = "manual", reason: str = ""):
+        conn = get_conn()
+        now = datetime.now().isoformat()
+        conn.execute(
+            """INSERT OR IGNORE INTO watch_pool (code, name, source, reason, added_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (code, name, source, reason, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def remove(self, code: str):
+        conn = get_conn()
+        conn.execute("DELETE FROM watch_pool WHERE code=?", (code,))
+        conn.commit()
+        conn.close()
+
+    def get(self, code: str) -> Optional[dict]:
+        conn = get_conn()
+        cur = conn.execute("SELECT * FROM watch_pool WHERE code=?", (code,))
         row = cur.fetchone()
         conn.close()
         return dict(row) if row else None

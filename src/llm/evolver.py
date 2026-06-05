@@ -115,8 +115,8 @@ class BacktestDB:
         conn.commit()
         conn.close()
 
-    def get_pending_signals(self, days: int = 7) -> List[Dict]:
-        """获取需要回填收益的信号"""
+    def get_pending_signals(self, days: int = 7, limit: int = 200) -> List[Dict]:
+        """获取需要回填收益的信号（最多 limit 条避免启动阻塞）"""
         conn = self._get_conn()
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
         rows = conn.execute("""
@@ -124,7 +124,8 @@ class BacktestDB:
             FROM signals
             WHERE timestamp > ? AND actual_return_1d = 0
             ORDER BY timestamp DESC
-        """, (cutoff,)).fetchall()
+            LIMIT ?
+        """, (cutoff, limit)).fetchall()
         conn.close()
 
         return [

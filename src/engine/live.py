@@ -3,7 +3,7 @@ import time
 import logging
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, time as dtime, timedelta
 from typing import Optional, List
 
 from rich.console import Console
@@ -56,6 +56,9 @@ class LiveEngine:
         self.running = False
         self._weights = settings.get("signal.weights", {})
         self._llm_enabled = settings.get("llm.enabled", True)
+        self._closing_done = False
+        self._today = ""
+        self._today_signals: list = []
 
         strategies = [
             TechnicalStrategy(),
@@ -190,8 +193,138 @@ class LiveEngine:
         tr = pd.concat([high - low, (high - close).abs(), (low - close).abs()], axis=1).max(axis=1)
         return float(tr.rolling(14).mean().iloc[-1])
 
+    # ── 时间段判断 + 收盘汇总 ──────────────────────────
+
+    def _reset_daily_flags(self):
+        today = date.today().isoformat()
+        if self._today != today:
+            self._today = today
+            self._closing_done = False
+            self._today_signals = []
+            log.info(f"=== 新交易日 {today} ===")
+
+    def _get_phase(self) -> str:
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return "holiday"
+        t = now.time()
+        if t < dtime(8, 50):
+            return "closed"
+        elif t < dtime(9, 15):
+            return "pre_market"
+        elif t < dtime(11, 30):
+            return "morning"
+        elif t < dtime(13, 0):
+            return "noon_break"
+        elif t < dtime(15, 0):
+            return "afternoon"
+        elif t < dtime(15, 15):
+            return "closing"
+        else:
+            return "closed"
+
+    def _sleep_until(self, hour: int, minute: int, label: str):
+        target = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+        wait = (target - datetime.now()).total_seconds()
+        if wait > 0:
+            console.print(f"[dim]💤 {label}，等待至 {hour:02d}:{minute:02d}[/dim]")
+            log.info(f"{label}，等待至 {hour:02d}:{minute:02d}")
+            for _ in range(int(wait)):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def closing_summary(self):
+        """收盘汇总：大盘指数 + 个股表现 + 后续关注点"""
+        if self._closing_done:
+            return
+        self._closing_done = True
+
+        console.print("\n[bold cyan]📊 生成收盘汇总...[/bold cyan]")
+        log.info("生成收盘汇总...")
+
+        # 1. 大盘指数
+        indices = self.data_manager.get_market_index()
+        idx_lines = []
+        if indices:
+            for name, data in indices.items():
+                idx_lines.append(
+                    f"  {name}: {data['price']:.2f} {data['change_pct']:+.2f}%"
+                )
+
+        # 2. 当日信号汇总（去重取最新）
+        action_map = {
+            "strong_buy": "🔴强买", "buy": "🟠买入", "hold": "⚪观望",
+            "sell": "🟢卖出", "strong_sell": "🔵强卖",
+        }
+        latest_signals = {}
+        for sig in self._today_signals:
+            latest_signals[sig.code] = sig
+
+        sig_lines = []
+        watch_points = []
+        for code, sig in latest_signals.items():
+            act = action_map.get(sig.action, sig.action)
+            sig_lines.append(
+                f"  {sig.name}({code}): ¥{sig.price:.2f} {act} 评分{sig.score:.0f}"
+            )
+            if sig.reasons:
+                sig_lines.append(f"    → {'; '.join(sig.reasons[:3])}")
+            if sig.action in ("buy", "strong_buy"):
+                watch_points.append(
+                    f"  🔴 {sig.name}({code}) 买入信号，止损¥{sig.stop_loss:.2f}"
+                )
+            elif sig.action in ("sell", "strong_sell"):
+                watch_points.append(f"  🟢 {sig.name}({code}) 卖出信号")
+            elif abs(sig.score) > 20:
+                watch_points.append(
+                    f"  👀 {sig.name}({code}) 评分{sig.score:.0f}，接近信号区间"
+                )
+
+        # 3. 持仓盈亏
+        positions = self.position_manager.get_all()
+        pos_lines = []
+        if positions:
+            for code, pos in positions.items():
+                cost = pos.get("cost", 0)
+                shares = pos.get("shares", 0)
+                if cost > 0 and shares > 0:
+                    quote = self.data_manager.get_realtime_quote(code)
+                    cur = quote.get("price", 0)
+                    if cur > 0:
+                        pnl = (cur - cost) / cost * 100
+                        pos_lines.append(
+                            f"  {pos.get('name', code)}: 成本¥{cost:.2f} "
+                            f"现价¥{cur:.2f} 盈亏{pnl:+.2f}%"
+                        )
+
+        report = f"""📊 A股收盘汇总 - {date.today().isoformat()}
+{'='*50}
+
+📈 大盘指数
+{chr(10).join(idx_lines) if idx_lines else '  无数据'}
+
+📊 持仓/关注股信号
+{'─'*40}
+{chr(10).join(sig_lines) if sig_lines else '  无信号数据'}
+
+💰 持仓盈亏
+{'─'*40}
+{chr(10).join(pos_lines) if pos_lines else '  无持仓'}
+
+🔮 后续关注
+{'─'*40}
+{chr(10).join(watch_points) if watch_points else '  暂无明确关注点'}
+
+{'='*50}"""
+
+        self.notifier.send(f"📊 A股收盘汇总 {date.today().isoformat()}", report)
+        console.print("[green]✅ 收盘汇总已推送[/green]")
+        log.info("收盘汇总已推送")
+
     def scan_all(self) -> list:
         results = []
+        self._reset_daily_flags()
         now = datetime.now().strftime("%H:%M:%S")
         console.print("\n" + "=" * 60)
         console.print(f"[bold]🔍 开始扫描 [{now}][/bold]")
@@ -226,6 +359,7 @@ class LiveEngine:
                 signal = self.scan_stock(stock)
                 if signal:
                     results.append(signal)
+                    self._today_signals.append(signal)
             except Exception as e:
                 import traceback
                 console.print(f"[red]扫描{stock.get('name')}失败: {e}[/red]")
@@ -303,6 +437,48 @@ class LiveEngine:
 
         while self.running:
             try:
+                phase = self._get_phase()
+
+                if phase == "closed":
+                    # 判断是否已过收盘时间但还没做收盘汇总
+                    now = datetime.now()
+                    if (dtime(15, 0) <= now.time() < dtime(15, 15)
+                            and not self._closing_done):
+                        self.closing_summary()
+                    elif now.time() >= dtime(15, 15) and not self._closing_done:
+                        self.closing_summary()
+
+                    console.print("[dim]💤 收盘，休眠至明日[/dim]")
+                    log.info("收盘，休眠至明日")
+                    # 休眠到次日 8:50
+                    tomorrow = (now + timedelta(days=1)).replace(
+                        hour=8, minute=50, second=0, microsecond=0
+                    )
+                    wait = (tomorrow - now).total_seconds()
+                    for _ in range(int(wait)):
+                        if not self.running:
+                            break
+                        time.sleep(1)
+                    continue
+
+                if phase == "holiday":
+                    console.print("[dim]💤 周末休市，休眠...[/dim]")
+                    for _ in range(3600):
+                        if not self.running:
+                            break
+                        time.sleep(1)
+                    continue
+
+                if phase == "noon_break":
+                    self._sleep_until(13, 0, "午间休市")
+                    continue
+
+                if phase == "closing":
+                    self.closing_summary()
+                    # 收盘汇总后进入 closed，下次循环会休眠
+                    continue
+
+                # morning / afternoon / pre_market: 扫描
                 self.scan_all()
                 if self.running:
                     next_time = datetime.now().timestamp() + interval_minutes * 60
@@ -312,6 +488,7 @@ class LiveEngine:
                         if not self.running:
                             break
                         time.sleep(1)
+
             except KeyboardInterrupt:
                 break
             except Exception as e:

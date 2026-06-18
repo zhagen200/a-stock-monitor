@@ -31,7 +31,11 @@ from src.execution.position import PositionManager
 from src.notify.notifier import Notifier
 from src.analytics.report import ReportGenerator
 from src.llm.client import LLMClient
+from src.llm.depot import LLMDepot
+from src.llm.analyzer import AIAnalysisEngine
+from src.llm.evolver import BacktestDB
 from src.data.news import NewsCollector
+from src.scanner.smart_picker import SmartStockPicker
 
 console = Console()
 
@@ -57,6 +61,7 @@ class LiveEngine:
         self._weights = settings.get("signal.weights", {})
         self._llm_enabled = settings.get("llm.enabled", True)
         self._closing_done = False
+        self._recommend_done = False
         self._today = ""
         self._today_signals: list = []
 
@@ -89,6 +94,7 @@ class LiveEngine:
         ])
 
         self.notifier = Notifier(settings.data)
+        self.picker = SmartStockPicker(settings.data)
         broker_type = settings.get("broker.type", "mock")
         if broker_type == "xtquant":
             from src.execution.broker import XtQuantBroker
@@ -123,6 +129,14 @@ class LiveEngine:
             s["code"] for s in settings.get_watchlist()
             if s.get("cost")
         }
+
+        # AI 多模型分析 + 回测数据库
+        self.llm_depot = LLMDepot(settings.data)
+        ai_cfg = settings.get("ai_analysis", {})
+        self._ai_enabled = ai_cfg.get("enabled", False)
+        self._ai_signal = ai_cfg.get("signal_analysis", False)
+        self.ai_engine = AIAnalysisEngine(self.llm_depot, settings.data) if self._ai_enabled else None
+        self.backtest_db = BacktestDB()
 
     def scan_stock(self, stock: dict) -> Optional[TradeSignal]:
         code = stock["code"]
@@ -163,6 +177,42 @@ class LiveEngine:
         signal.take_profit_1 = self._calc_take_profit(kline, price, 1)
         signal.take_profit_2 = self._calc_take_profit(kline, price, 2)
 
+        # AI 深度分析
+        ai_analysis = None
+        if self._ai_enabled and self._ai_signal and self.ai_engine:
+            try:
+                sig_data = {
+                    'code': code, 'name': name, 'price': price,
+                    'score': signal.score, 'action': signal.action,
+                    'confidence': signal.confidence,
+                    'stop_loss': signal.stop_loss,
+                    'take_profit_1': signal.take_profit_1,
+                    'take_profit_2': signal.take_profit_2,
+                }
+                indices = self.data_manager.get_market_index() or {}
+                tech_data = {
+                    'total_score': getattr(signal, 'technical_score', 0),
+                    'signals': [{'name': r, 'signal': '', 'description': r} for r in signal.reasons[:5]],
+                }
+                ai_analysis = self.ai_engine.analyze_signal(
+                    sig_data, tech_data, fund_flow or {}, [], indices,
+                )
+            except Exception as e:
+                log.error(f"AI信号分析失败 {code}: {e}")
+
+        # 存入回测数据库
+        try:
+            self.backtest_db.save_signal(
+                signal_data={
+                    'code': code, 'name': name,
+                    'action': signal.action, 'score': signal.score, 'price': price,
+                },
+                ai_analysis=ai_analysis.ai_reasoning if ai_analysis else "",
+                ai_confidence=ai_analysis.confidence_adjustment if ai_analysis else 0,
+            )
+        except Exception as e:
+            log.error(f"回测存储失败 {code}: {e}")
+
         ctx = {"change_pct": change_pct}
         self.signal_bus.process(signal, ctx)
 
@@ -195,11 +245,98 @@ class LiveEngine:
 
     # ── 时间段判断 + 收盘汇总 ──────────────────────────
 
+    def _backfill_returns(self):
+        """回填历史信号的实际收益"""
+        from src.data.collector import StockDataCollector
+        collector = StockDataCollector()
+        pending = self.backtest_db.get_pending_signals(days=10)
+        if not pending:
+            return
+        filled = 0
+        for sig in pending:
+            try:
+                kline = collector.get_kline(sig['code'], days=20)
+                if kline.empty:
+                    continue
+                sig_date = datetime.fromisoformat(sig['timestamp']).date()
+                close_prices = kline['close']
+                future = close_prices[close_prices.index.date > sig_date]
+                if len(future) < 1:
+                    continue
+                entry_price = sig['price']
+                returns = {}
+                for days, key in [(1, 'return_1d'), (3, 'return_3d'), (5, 'return_5d'), (10, 'return_10d')]:
+                    if len(future) >= days:
+                        returns[key] = (future.iloc[days-1] / entry_price - 1) * 100
+                if returns:
+                    if len(future) >= 2:
+                        peak = entry_price
+                        max_dd = 0
+                        for p in future.iloc[:10]:
+                            peak = max(peak, p)
+                            dd = (peak - p) / peak * 100
+                            max_dd = max(max_dd, dd)
+                        returns['max_drawdown'] = max_dd
+                    self.backtest_db.update_actual_returns(sig['id'], returns)
+                    filled += 1
+            except Exception as e:
+                log.error(f"回填收益失败 {sig['code']}: {e}")
+        if filled > 0:
+            log.info(f"回填了 {filled} 条信号的实际收益")
+
+    def daily_recommend(self):
+        """每日智能推荐 + AI推理"""
+        if self._recommend_done:
+            return
+        self._recommend_done = True
+
+        console.print("\n[bold cyan]🔍 每日智能选股扫描...[/bold cyan]")
+        log.info("每日智能选股扫描...")
+
+        candidates = self.picker.scan_short_term_opportunities(max_count=10)
+
+        if candidates:
+            msg_lines = [f"📊 今日推荐 {len(candidates)} 只短线机会\n"]
+            for s in candidates:
+                msg_lines.append(
+                    f"• {s['code']} {s['name']} ¥{s['price']:.2f} "
+                    f"{s['change_pct']:+.2f}% 主力净流入{s['main_net_inflow']/1e4:.0f}万"
+                )
+
+            # AI 推理推荐理由
+            ai_reasons = []
+            if self._ai_enabled and self.ai_engine:
+                for s in candidates[:3]:
+                    try:
+                        analysis = self.ai_engine.analyze_signal(
+                            signal_data={'code': s['code'], 'name': s['name'],
+                                         'price': s['price'], 'score': s.get('score', 0),
+                                         'action': 'buy', 'confidence': 50,
+                                         'stop_loss': s['price']*0.95,
+                                         'take_profit_1': s['price']*1.05,
+                                         'take_profit_2': s['price']*1.10},
+                            tech_data={}, fund_flow={'main_net_inflow': s['main_net_inflow']},
+                            news_list=[], market_indices=self.data_manager.get_market_index() or {},
+                        )
+                        ai_reasons.append(f"• {s['name']}: {analysis.ai_reasoning[:100]}")
+                    except Exception as e:
+                        log.error(f"AI推荐分析失败 {s['code']}: {e}")
+
+            if ai_reasons:
+                msg_lines.append("\n🤖 AI分析:")
+                msg_lines.extend(ai_reasons)
+
+            self.notifier.send(f"📊 今日推荐 {len(candidates)} 只短线机会", "\n".join(msg_lines))
+            log.info(f"推荐 {len(candidates)} 只股票")
+        else:
+            log.info("今日无合适推荐")
+
     def _reset_daily_flags(self):
         today = date.today().isoformat()
         if self._today != today:
             self._today = today
             self._closing_done = False
+            self._recommend_done = False
             self._today_signals = []
             log.info(f"=== 新交易日 {today} ===")
 
@@ -242,6 +379,9 @@ class LiveEngine:
 
         console.print("\n[bold cyan]📊 生成收盘汇总...[/bold cyan]")
         log.info("生成收盘汇总...")
+
+        # 回填历史信号收益
+        self._backfill_returns()
 
         # 1. 大盘指数
         indices = self.data_manager.get_market_index()
@@ -298,6 +438,15 @@ class LiveEngine:
                             f"现价¥{cur:.2f} 盈亏{pnl:+.2f}%"
                         )
 
+        # 4. 回测统计
+        stats = self.backtest_db.get_signal_stats(days=7)
+        stats_lines = []
+        for action, s in stats.items():
+            stats_lines.append(
+                f"  {action}: {s['total']}次, 1日准确率{s['accuracy_1d']:.0f}%, "
+                f"平均收益{s['avg_return_1d']:+.2f}%"
+            )
+
         report = f"""📊 A股收盘汇总 - {date.today().isoformat()}
 {'='*50}
 
@@ -312,9 +461,16 @@ class LiveEngine:
 {'─'*40}
 {chr(10).join(pos_lines) if pos_lines else '  无持仓'}
 
+📉 本周信号回测
+{'─'*40}
+{chr(10).join(stats_lines) if stats_lines else '  数据不足'}
+
 🔮 后续关注
 {'─'*40}
 {chr(10).join(watch_points) if watch_points else '  暂无明确关注点'}
+
+🤖 LLM使用统计
+{self.llm_depot.get_usage_report()}
 
 {'='*50}"""
 
@@ -431,9 +587,19 @@ class LiveEngine:
         console.print(f"   监控间隔: {interval_minutes}分钟")
         watchlist = settings.get_watchlist()
         console.print(f"   自选股: {len(watchlist)}只")
+        ai_status = "✅ 多模型" if self._ai_enabled and len(self.llm_depot.models) > 1 else "✅ 单模型" if self._ai_enabled else "❌"
+        console.print(f"   AI分析: {ai_status}")
         console.print(f"   LLM: {'✅ 已启用' if self.llm else '❌ 未启用'}")
         console.print(f"   自动执行: {'✅' if self.signal_bus.auto_execute else '❌ 仅信号'}")
         console.print(f"   按 Ctrl+C 停止\n")
+
+        log.info(f"🚀 启动 | AI:{ai_status} | 持仓:{len(watchlist)}只")
+
+        # 启动时回填历史信号收益
+        try:
+            self._backfill_returns()
+        except Exception as e:
+            log.warning(f"启动回填收益失败: {e}")
 
         while self.running:
             try:
@@ -478,7 +644,14 @@ class LiveEngine:
                     # 收盘汇总后进入 closed，下次循环会休眠
                     continue
 
-                # morning / afternoon / pre_market: 扫描
+                # pre_market: 盘前推荐
+                if phase == "pre_market":
+                    self._reset_daily_flags()
+                    self.daily_recommend()
+                    self._sleep_until(9, 15, "等待开盘")
+                    continue
+
+                # morning / afternoon: 扫描
                 self.scan_all()
                 if self.running:
                     next_time = datetime.now().timestamp() + interval_minutes * 60
